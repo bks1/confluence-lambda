@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion:          '2010-09-09'
+
+Parameters:
+
+  LambdaBucketName:
+    Type: String
+    Description: The name of the S3 bucket that has the code
+
+  S3FunctionCodeVersion:
+    Type: String
+    Description: The S3ObjectVersion for the function code
+
+  Name:
+    Type: String
+    Description: Name of lambda
+
+  ConfluenceUsername:
+    Type: String
+    Description: ARN of the SSM parameter for the confluence username
+
+  ConfluencePassword:
+    Type: String
+    Description: ARN of the SSM parameter for the confluence password
+
+  ConfluenceKMS:
+    Type: String
+    Description: ARN of the KMS key used to encrypt the credential
+
+
+Resources:
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref Name
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucketName
+        S3Key: code.zip
+        S3ObjectVersion: !Ref S3FunctionCodeVersion
+      Runtime: nodejs8.10
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Name}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub ${Name}-lambda-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - ssm:GetParameter
+            Resource:
+              - !Ref ConfluenceUsername
+              - !Ref ConfluencePassword
+          - Effect: Allow
+            Action:
+            - kms:Decrypt
+            Resource:
+            - !Ref ConfluenceKMS 

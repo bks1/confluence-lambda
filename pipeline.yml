@@ -1,0 +1,197 @@
+Parameters:
+  PipelineKMSKey:
+    Type: String
+    Description: ARN to a KMS key to use to encrypt the pipeline bucket with
+
+  PipelineRoleARN:
+    Type: String
+    Description: ARN for a role for the pipeline to use
+
+  PipelineCloudFormationRoleARN:
+    Type: String
+    Description: ARN for a role for the cloudformation to use
+
+  WebHookSecret:
+    Description: Secert for the webhook stored in parameter store
+    Type: AWS::SSM::Parameter::Value<String>
+    NoEcho: true
+
+  CodeBuildRole:
+    Type: String
+    Description: ARN of the CodeBuild Service Role
+
+  GitHubOwner:
+    Type: String
+    Description: Name of the owner (Organization or person) in Github that owns the repo
+
+  GitHubRepo:
+    Type: String
+    Description: Name of the repo in Github
+
+  GitHubBranch:
+    Type: String
+    Description: Name of the branch to use from the git repo
+    Default: master
+
+  GitHubOAuthToken:
+    Type: String
+    Description: OAuth token to Github to pull code from
+    NoEcho: true
+
+  Name:
+    Type: String
+    Description: Name of the lambda & pipeline
+
+Resources:
+
+  PipelineS3Bucket:
+    Type: AWS::S3::Bucket
+
+  LambdaS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  Pipeline:
+    DependsOn:
+      - PipelineS3Bucket
+      - LambdaS3Bucket
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name:    !Sub ${Name}-pipeline
+      RoleArn: !Ref PipelineRoleARN
+      ArtifactStore:
+        Type:     S3
+        Location: !Ref PipelineS3Bucket
+        EncryptionKey:
+          Id:   !Ref PipelineKMSKey
+          Type: KMS
+      Stages:
+        - Name: Source
+          Actions:
+             -Name: SourceAction
+              ActionTypeId: 
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts: 
+                - Name: source
+              Configuration: 
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: UpdatePipeline
+          Actions:
+            - Name: DeployPipeline
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              RunOrder: 1
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !Ref PipelineCloudFormationRoleARN
+                StackName: !Ref AWS::StackName
+                TemplatePath: source::pipeline.yml
+        - Name: BuildArtifacts
+          Actions:
+            - Name: BuildAndUpload
+              ActionTypeId:
+                Category: Build
+                Owner:    AWS
+                Provider: CodeBuild
+                Version: '1'
+              RunOrder:   1
+              InputArtifacts:
+                - Name: source
+              OutputArtifacts:
+                - Name: output
+              Configuration:
+                ProjectName: !Sub ${Name}-deployment
+
+        - Name: DeployLambda
+          Actions:
+            - Name: DeployLambda
+              InputArtifacts:
+                - Name: source
+                - Name: output
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              RunOrder: 3
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !Ref PipelineCloudFormationRoleARN
+                StackName: !Sub ${Name}-stack
+                TemplatePath: source::cloudformation.yml
+                ParameterOverrides: !Sub |
+                  {
+                    "LambdaBucketName": "${LambdaS3Bucket}",
+                    "S3FunctionCodeVersion": { "Fn::GetParam": [ "output", "output.json", "VersionId" ] }
+                  }
+
+
+  GHWebHook:
+    DependsOn:
+      - Pipeline
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      AuthenticationConfiguration:
+        SecretToken: !Ref WebHookSecret
+      Filters:
+        - JsonPath: '$.ref'
+          MatchEquals: !Sub refs/heads/${GitBranch}
+      Authentication: GITHUB_HMAC
+      TargetPipeline: !Ref Pipeline
+      TargetAction: !Ref SourceActionProviderName
+      Name: !Ref AWS::StackName
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+
+  Deploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Name}-deployment
+      Description: Uploads deployment scripts
+      ServiceRole: !Ref CodeBuildRole
+      TimeoutInMinutes: 5
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:10.1.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec:
+          !Sub |
+            version: 0.2
+            artifacts:
+              discard-paths: yes
+              files:
+                - output.json
+            phases:
+              build:
+                commands:
+                  - npm install
+                  - zip -r code.zip index.js confluence.ejs node_modules;
+              post_build:
+                commands:
+                  - du -hs *
+                  - aws s3api put-object --bucket ${LambdaS3Bucket} --key code.zip --body code.zip --output json > output.json;
+
+Outputs:
+  WebHookURL:
+    Value:  !GetAtt GHWebHook.Url
+    Export:
+      Name: !Sub ${Name}-webhook-url
